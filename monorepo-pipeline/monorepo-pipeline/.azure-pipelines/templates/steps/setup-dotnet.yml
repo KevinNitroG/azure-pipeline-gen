@@ -1,0 +1,18 @@
+steps:
+  - task: UseDotNet@2
+    displayName: Use .NET SDK from global.json
+    inputs:
+      packageType: sdk
+      useGlobalJson: true
+      workingDirectory: $(Build.SourcesDirectory)
+
+  - task: NuGetAuthenticate@1
+    displayName: Authenticate NuGet feeds
+
+  - task: Cache@2
+    displayName: Cache NuGet packages
+    inputs:
+      key: 'nuget | "$(Agent.OS)" | **/packages.lock.json, !**/bin/**, !**/obj/**'
+      restoreKeys: |
+        nuget | "$(Agent.OS)"
+      path: $(NUGET_PACKAGES)

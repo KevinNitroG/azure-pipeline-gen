@@ -1,0 +1,81 @@
+parameters:
+  - name: shards
+    type: object
+    default: [1, 2, 3, 4]
+
+stages:
+  - stage: E2E
+    displayName: End-to-end (Playwright, sharded)
+    dependsOn: [Detect, Codegen, Quality, BuildTest, Integration, Package]
+    condition: and(not(failed()), not(canceled()), ne(variables['Build.Reason'], 'PullRequest'), eq(dependencies.Detect.outputs['Plan.plan.affected_e2e'], 'true'))
+    jobs:
+      - job: Playwright
+        displayName: Playwright
+        timeoutInMinutes: 40
+        strategy:
+          maxParallel: 4
+          matrix:
+            ${{ each shard in parameters.shards }}:
+              shard_${{ shard }}:
+                shardIndex: ${{ shard }}
+                shardTotal: ${{ length(parameters.shards) }}
+        pool:
+          vmImage: ubuntu-24.04
+        variables:
+          semver: $[ stageDependencies.Detect.Version.outputs['ver.semver'] ]
+        steps:
+          - template: ../steps/checkout.yml
+          - template: ../steps/setup-node.yml
+            parameters:
+              filter: ./tests/e2e...
+
+          - task: Docker@2
+            displayName: Login to ACR
+            inputs:
+              command: login
+              containerRegistry: $(acrServiceConnection)
+
+          - task: DownloadPipelineArtifact@2
+            displayName: Download pkg-web
+            inputs:
+              buildType: current
+              artifactName: pkg-web
+              targetPath: $(Build.SourcesDirectory)/deploy/compose/web-dist
+
+          - bash: |
+              set -euo pipefail
+              export API_IMAGE="$(acrName).azurecr.io/acme/api:$(semver)"
+              export WORKER_IMAGE="$(acrName).azurecr.io/acme/worker:$(semver)"
+              export WEB_DIST_DIR="$PWD/deploy/compose/web-dist"
+              docker compose -f deploy/compose/e2e.yml up -d --wait --wait-timeout 180
+            displayName: docker compose up (images built in this run)
+
+          - bash: pnpm --filter ./tests/e2e exec playwright install --with-deps chromium
+            displayName: Install browsers
+
+          - bash: >
+              pnpm --filter ./tests/e2e exec playwright test
+              --shard=$(shardIndex)/$(shardTotal)
+              --reporter=junit,html
+            displayName: Playwright shard $(shardIndex)/$(shardTotal)
+            env:
+              BASE_URL: http://localhost:8080
+              PLAYWRIGHT_JUNIT_OUTPUT_FILE: $(Build.SourcesDirectory)/tests/e2e/test-results/junit.xml
+
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: tests/e2e/test-results/junit.xml
+              searchFolder: $(Build.SourcesDirectory)
+              testRunTitle: e2e shard $(shardIndex)
+
+          - publish: $(Build.SourcesDirectory)/tests/e2e/playwright-report
+            artifact: playwright-report-$(shardIndex)
+            condition: failed()
+
+          - bash: |
+              docker compose -f deploy/compose/e2e.yml logs --no-color --tail=300 || true
+              docker compose -f deploy/compose/e2e.yml down -v || true
+            displayName: Compose logs and teardown
+            condition: always()

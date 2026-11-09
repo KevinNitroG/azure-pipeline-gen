@@ -1,0 +1,75 @@
+parameters:
+  - name: jobName
+    type: string
+  - name: displayName
+    type: string
+  - name: project
+    type: object
+  - name: dependsOn
+    type: object
+    default: []
+  - name: mainPackage
+    type: string
+    default: ./cmd/worker
+
+jobs:
+  - job: ${{ parameters.jobName }}
+    displayName: ${{ parameters.displayName }}
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: and(succeeded(), eq(stageDependencies.Detect.Plan.outputs['plan.needed_${{ parameters.project.key }}'], 'true'))
+    timeoutInMinutes: 30
+    pool:
+      vmImage: ubuntu-24.04
+    variables:
+      runTests: $[ stageDependencies.Detect.Plan.outputs['plan.affected_${{ parameters.project.key }}'] ]
+      semver: $[ stageDependencies.Detect.Version.outputs['ver.semver'] ]
+    steps:
+      - template: ../steps/checkout.yml
+      - template: ../steps/setup-go.yml
+      - template: ../steps/download-generated.yml
+
+      - bash: go build ./...
+        displayName: Compile all packages
+        workingDirectory: $(Build.SourcesDirectory)/${{ parameters.project.path }}
+
+      - bash: |
+          set -euo pipefail
+          go install gotest.tools/gotestsum@v1.12.0
+          go install github.com/boumenot/gocover-cobertura@v1.3.0
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          mkdir -p "$(Agent.TempDirectory)/go"
+          gotestsum --junitfile "$(Agent.TempDirectory)/go/junit.xml" --format testname -- \
+            -race -covermode=atomic -coverprofile="$(Agent.TempDirectory)/go/cover.out" ./...
+          gocover-cobertura < "$(Agent.TempDirectory)/go/cover.out" > "$(Agent.TempDirectory)/go/cobertura.xml"
+        displayName: Unit tests with race detector (affected only)
+        condition: and(succeeded(), eq(variables.runTests, 'true'))
+        workingDirectory: $(Build.SourcesDirectory)/${{ parameters.project.path }}
+
+      - task: PublishTestResults@2
+        displayName: Publish test results
+        condition: and(succeededOrFailed(), eq(variables.runTests, 'true'))
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: junit.xml
+          searchFolder: $(Agent.TempDirectory)/go
+          testRunTitle: ${{ parameters.project.name }} (go)
+
+      - task: PublishCodeCoverageResults@2
+        displayName: Publish coverage
+        condition: and(succeededOrFailed(), eq(variables.runTests, 'true'))
+        inputs:
+          summaryFileLocation: $(Agent.TempDirectory)/go/cobertura.xml
+          failIfCoverageEmpty: false
+
+      - bash: |
+          set -euo pipefail
+          mkdir -p "$(Build.ArtifactStagingDirectory)/svc"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags "-s -w -X main.version=$(semver)" \
+            -o "$(Build.ArtifactStagingDirectory)/svc/${{ parameters.project.name }}" ${{ parameters.mainPackage }}
+        displayName: Build linux/amd64 binary
+        workingDirectory: $(Build.SourcesDirectory)/${{ parameters.project.path }}
+
+      - publish: $(Build.ArtifactStagingDirectory)/svc
+        artifact: svc-${{ parameters.project.name }}
+        displayName: Publish svc-${{ parameters.project.name }}

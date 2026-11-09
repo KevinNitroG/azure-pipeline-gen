@@ -1,0 +1,37 @@
+# Downloads the `generated` artifact (built by the Codegen stage, or by another pipeline
+# via a pipeline resource) and fans it out to where each project expects it:
+#
+#   ts-client/        -> packages/contracts/src/generated
+#   csharp/           -> packages/contracts/generated/csharp   (ProjectReference'd by services/api)
+#   go/               -> packages/contracts/generated/go       (go.work member, used by services/worker)
+#   proto/            -> packages/contracts/generated/proto
+#   openapi/          -> packages/contracts/generated/openapi  (docs, contract tests)
+parameters:
+  - name: source            # 'current' or the alias of a pipeline resource
+    type: string
+    default: current
+  - name: generatedDir      # where the artifact lands
+    type: string
+    default: $(Pipeline.Workspace)/generated
+  - name: condition
+    type: string
+    default: succeeded()
+
+steps:
+  - download: ${{ parameters.source }}
+    artifact: generated
+    displayName: Download generated contracts
+    condition: ${{ parameters.condition }}
+
+  - bash: |
+      set -euo pipefail
+      G="${{ parameters.generatedDir }}"
+      S="$(Build.SourcesDirectory)"
+      place() { [ -d "$G/$1" ] && { mkdir -p "$S/$2"; cp -a "$G/$1/." "$S/$2/"; echo "placed $1 -> $2"; } || echo "skip $1 (not generated)"; }
+      place ts-client packages/contracts/src/generated
+      place csharp    packages/contracts/generated/csharp
+      place go        packages/contracts/generated/go
+      place proto     packages/contracts/generated/proto
+      place openapi   packages/contracts/generated/openapi
+    displayName: Place generated sources into the workspace
+    condition: ${{ parameters.condition }}

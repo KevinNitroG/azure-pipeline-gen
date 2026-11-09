@@ -1,0 +1,80 @@
+stages:
+  - stage: Package
+    displayName: Container images
+    dependsOn: [Detect, Codegen, Quality, BuildTest, Integration]
+    condition: and(not(failed()), not(canceled()), eq(dependencies.Detect.outputs['Plan.plan.needs_images'], 'true'))
+    jobs:
+      - job: Image
+        displayName: Build, scan, push
+        condition: and(succeeded(), ne(stageDependencies.Detect.Plan.outputs['plan.matrix_image'], '{}'))
+        timeoutInMinutes: 30
+        strategy:
+          maxParallel: 3
+          matrix: $[ stageDependencies.Detect.Plan.outputs['plan.matrix_image'] ]
+        pool:
+          vmImage: ubuntu-24.04
+        variables:
+          semver: $[ stageDependencies.Detect.Version.outputs['ver.semver'] ]
+        steps:
+          - template: ../steps/checkout.yml
+
+          - task: DownloadPipelineArtifact@2
+            displayName: Download svc-$(imageName)
+            inputs:
+              buildType: current
+              artifactName: svc-$(imageName)
+              targetPath: $(Build.SourcesDirectory)/$(imageContext)/publish
+
+          - task: Docker@2
+            displayName: Login to ACR
+            inputs:
+              command: login
+              containerRegistry: $(acrServiceConnection)
+
+          - bash: |
+              set -euo pipefail
+              IMAGE="$(acrName).azurecr.io/$(imageRepo)"
+              SHORT_SHA="$(echo "$(Build.SourceVersion)" | cut -c1-8)"
+              docker buildx create --use --name ci-builder > /dev/null
+              docker buildx build \
+                --file "$(imageDockerfile)" "$(imageContext)" \
+                --tag "$IMAGE:$(semver)" --tag "$IMAGE:sha-${SHORT_SHA}" \
+                --label "org.opencontainers.image.revision=$(Build.SourceVersion)" \
+                --label "org.opencontainers.image.version=$(semver)" \
+                --label "org.opencontainers.image.source=$(Build.Repository.Uri)" \
+                --cache-from "type=registry,ref=${IMAGE}:buildcache" \
+                --cache-to "type=registry,ref=${IMAGE}:buildcache,mode=max" \
+                --load
+            displayName: docker buildx build (registry cache)
+
+          - bash: |
+              set -euo pipefail
+              IMAGE="$(acrName).azurecr.io/$(imageRepo):$(semver)"
+              mkdir -p "$(Build.ArtifactStagingDirectory)/sbom"
+              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.57.1 image \
+                --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$IMAGE"
+              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                -v "$(Build.ArtifactStagingDirectory)/sbom:/out" aquasec/trivy:0.57.1 image \
+                --format cyclonedx --output "/out/$(imageName).cdx.json" "$IMAGE"
+            displayName: Trivy image scan + CycloneDX SBOM
+
+          - publish: $(Build.ArtifactStagingDirectory)/sbom
+            artifact: sbom-$(imageName)
+            condition: succeededOrFailed()
+
+          - bash: |
+              set -euo pipefail
+              IMAGE="$(acrName).azurecr.io/$(imageRepo)"
+              docker push --all-tags "$IMAGE"
+              DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$(semver)" | cut -d@ -f2)"
+              mkdir -p "$(Build.ArtifactStagingDirectory)/manifest"
+              jq -n --arg name "$(imageName)" --arg repository "$IMAGE" --arg tag "$(semver)" --arg digest "$DIGEST" \
+                '{name:$name,repository:$repository,tag:$tag,digest:$digest}' \
+                > "$(Build.ArtifactStagingDirectory)/manifest/$(imageName).json"
+              cat "$(Build.ArtifactStagingDirectory)/manifest/$(imageName).json"
+            displayName: Push and capture digest (non-PR)
+            condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+          - publish: $(Build.ArtifactStagingDirectory)/manifest
+            artifact: image-manifest-$(imageName)
+            condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))

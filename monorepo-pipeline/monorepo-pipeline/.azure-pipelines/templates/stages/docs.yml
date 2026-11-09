@@ -1,0 +1,92 @@
+parameters:
+  - name: deployDocs
+    type: boolean
+    default: true
+
+stages:
+  - stage: Docs
+    displayName: Documentation
+    dependsOn: [Detect, Codegen, BuildTest]
+    condition: and(not(failed()), not(canceled()), eq(dependencies.Detect.outputs['Plan.plan.affected_docs'], 'true'))
+    jobs:
+      - job: Build
+        displayName: Build docs site (Docusaurus + TypeDoc + Redocly + DocFX)
+        timeoutInMinutes: 30
+        pool:
+          vmImage: ubuntu-24.04
+        variables:
+          semver: $[ stageDependencies.Detect.Version.outputs['ver.semver'] ]
+        steps:
+          - template: ../steps/checkout.yml
+          - template: ../steps/download-generated.yml
+          - download: current
+            artifact: docs-api-xml
+            displayName: Download .NET XML docs
+            continueOnError: true
+          - template: ../steps/build-docs.yml
+            parameters:
+              version: $(semver)
+
+      - job: LinkCheck
+        displayName: Internal link check
+        dependsOn: Build
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - checkout: none
+          - download: current
+            artifact: docs-site
+          - bash: |
+              docker run --rm -v "$(Pipeline.Workspace)/docs-site:/input:ro" lycheeverse/lychee:latest \
+                --offline --no-progress --root-dir /input '/input/**/*.html'
+            displayName: lychee --offline
+
+      - ${{ if eq(parameters.deployDocs, true) }}:
+          - job: Preview
+            displayName: Deploy PR preview
+            dependsOn: [Build, LinkCheck]
+            condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+            pool:
+              vmImage: ubuntu-24.04
+            steps:
+              - checkout: self
+                fetchDepth: 1
+              - task: DownloadPipelineArtifact@2
+                inputs:
+                  buildType: current
+                  artifactName: docs-site
+                  targetPath: $(System.DefaultWorkingDirectory)/docs-site
+              - task: AzureStaticWebApp@0
+                displayName: Publish preview environment
+                inputs:
+                  app_location: docs-site
+                  skip_app_build: true
+                  skip_api_build: true
+                  azure_static_web_apps_api_token: $(docsSwaToken)
+
+          - deployment: Publish
+            displayName: Publish docs to production
+            dependsOn: [Build, LinkCheck]
+            condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+            pool:
+              vmImage: ubuntu-24.04
+            environment: acme-docs-production
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: self
+                      fetchDepth: 1
+                    - task: DownloadPipelineArtifact@2
+                      inputs:
+                        buildType: current
+                        artifactName: docs-site
+                        targetPath: $(System.DefaultWorkingDirectory)/docs-site
+                    - task: AzureStaticWebApp@0
+                      displayName: Deploy docs
+                      inputs:
+                        app_location: docs-site
+                        skip_app_build: true
+                        skip_api_build: true
+                        azure_static_web_apps_api_token: $(docsSwaToken)
+                        deployment_environment: production

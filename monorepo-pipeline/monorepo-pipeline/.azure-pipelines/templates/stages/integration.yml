@@ -1,0 +1,116 @@
+stages:
+  - stage: Integration
+    displayName: Integration and contract tests
+    dependsOn: [Detect, Codegen, BuildTest]
+    condition: and(not(failed()), not(canceled()), or(eq(dependencies.Detect.outputs['Plan.plan.affected_api'], 'true'), eq(dependencies.Detect.outputs['Plan.plan.affected_worker'], 'true')))
+    jobs:
+      # ---------------------------------------------------------------- api <-> postgres + redis
+      - job: ApiIntegration
+        displayName: api integration (Postgres + Redis service containers)
+        condition: and(succeeded(), eq(stageDependencies.Detect.Plan.outputs['plan.affected_api'], 'true'))
+        timeoutInMinutes: 30
+        pool:
+          vmImage: ubuntu-24.04
+        services:
+          postgres: postgres
+          redis: redis
+        steps:
+          - template: ../steps/checkout.yml
+          - template: ../steps/setup-dotnet.yml
+          - template: ../steps/download-generated.yml
+          - script: >
+              dotnet test services/api/Acme.Api.sln -c Release
+              --filter "Category=Integration"
+              --logger "trx;LogPrefix=false"
+              --results-directory "$(Agent.TempDirectory)/trx"
+            displayName: Integration tests
+            env:
+              ConnectionStrings__Default: Host=localhost;Port=5432;Database=acme_test;Username=postgres;Password=ci
+              Redis__Configuration: localhost:6379
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: VSTest
+              testResultsFiles: '*.trx'
+              searchFolder: $(Agent.TempDirectory)/trx
+              testRunTitle: api integration
+
+      # ---------------------------------------------------------------- worker <-> redis
+      - job: WorkerIntegration
+        displayName: worker integration (Redis service container)
+        condition: and(succeeded(), eq(stageDependencies.Detect.Plan.outputs['plan.affected_worker'], 'true'))
+        timeoutInMinutes: 20
+        pool:
+          vmImage: ubuntu-24.04
+        services:
+          redis: redis
+        steps:
+          - template: ../steps/checkout.yml
+          - template: ../steps/setup-go.yml
+          - template: ../steps/download-generated.yml
+          - bash: |
+              set -euo pipefail
+              go install gotest.tools/gotestsum@v1.12.0
+              mkdir -p "$(Agent.TempDirectory)/go"
+              "$(go env GOPATH)/bin/gotestsum" --junitfile "$(Agent.TempDirectory)/go/junit.xml" -- \
+                -tags=integration -race ./...
+            displayName: go test -tags=integration
+            workingDirectory: $(Build.SourcesDirectory)/services/worker
+            env:
+              REDIS_ADDR: localhost:6379
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: junit.xml
+              searchFolder: $(Agent.TempDirectory)/go
+              testRunTitle: worker integration
+
+      # ---------------------------------------------------------------- spec <-> running api (schema fuzzing)
+      - job: ContractFuzz
+        displayName: api vs OpenAPI spec (schemathesis)
+        condition: and(succeeded(), eq(stageDependencies.Detect.Plan.outputs['plan.affected_api'], 'true'))
+        timeoutInMinutes: 20
+        pool:
+          vmImage: ubuntu-24.04
+        services:
+          postgres: postgres
+        steps:
+          - checkout: none
+          - download: current
+            artifact: svc-api
+          - download: current
+            artifact: generated
+          - task: UseDotNet@2
+            inputs:
+              packageType: aspnetcore
+              version: 8.x
+          - bash: |
+              set -euo pipefail
+              dotnet "$(Pipeline.Workspace)/svc-api/Acme.Api.dll" --urls http://127.0.0.1:5080 \
+                > "$(Agent.TempDirectory)/api.log" 2>&1 &
+              echo $! > "$(Agent.TempDirectory)/api.pid"
+              curl --retry 30 --retry-delay 2 --retry-connrefused --fail -s http://127.0.0.1:5080/healthz
+            displayName: Start API from published artifact
+            env:
+              ASPNETCORE_ENVIRONMENT: Testing
+              ConnectionStrings__Default: Host=localhost;Port=5432;Database=acme_test;Username=postgres;Password=ci
+          - bash: |
+              set -euo pipefail
+              pip install --quiet "schemathesis==3.38.0"
+              schemathesis run "$(Pipeline.Workspace)/generated/openapi/bundled.yaml" \
+                --base-url http://127.0.0.1:5080 --checks all \
+                --hypothesis-max-examples=50 --junit-xml="$(Agent.TempDirectory)/schemathesis.xml"
+            displayName: Fuzz the API against the bundled spec
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: schemathesis.xml
+              searchFolder: $(Agent.TempDirectory)
+              testRunTitle: contract fuzzing
+          - bash: |
+              kill "$(cat "$(Agent.TempDirectory)/api.pid")" 2>/dev/null || true
+              tail -n 200 "$(Agent.TempDirectory)/api.log" || true
+            displayName: Stop API and show log tail
+            condition: always()

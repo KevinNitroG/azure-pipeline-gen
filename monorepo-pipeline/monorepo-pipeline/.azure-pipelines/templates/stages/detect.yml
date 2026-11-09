@@ -1,0 +1,45 @@
+parameters:
+  - name: forceAll
+    type: boolean
+    default: false
+
+stages:
+  - stage: Detect
+    displayName: Plan
+    dependsOn: []
+    jobs:
+      - job: Plan
+        displayName: Detect affected projects
+        timeoutInMinutes: 10
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - template: ../steps/checkout.yml
+            parameters:
+              fetchDepth: 0
+          - task: NodeTool@0
+            displayName: Use Node $(nodeVersion)
+            inputs:
+              versionSpec: $(nodeVersion)
+          - bash: node .azure-pipelines/scripts/detect-changes.js
+            name: plan
+            displayName: Compute affected and needed projects
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              FORCE_ALL: ${{ parameters.forceAll }}
+          - publish: $(Build.ArtifactStagingDirectory)/plan
+            artifact: plan
+            condition: succeededOrFailed()
+
+      - job: Version
+        displayName: Compute version
+        timeoutInMinutes: 5
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - template: ../steps/checkout.yml
+            parameters:
+              fetchDepth: 0
+          - bash: bash .azure-pipelines/scripts/compute-version.sh
+            name: ver
+            displayName: Conventional-commit semver

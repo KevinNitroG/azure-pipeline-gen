@@ -1,0 +1,96 @@
+stages:
+  - stage: BuildTest
+    displayName: Build and unit test
+    dependsOn: [Detect, Codegen]
+    condition: and(not(failed()), not(canceled()), eq(dependencies.Detect.outputs['Plan.plan.affected_any'], 'true'))
+    jobs:
+      # ------------------------------------------------------------- TypeScript workspace
+      # Order mirrors the graph: contracts -> shared-utils -> ui-kit -> web.
+      # A job runs if its project is *needed* (affected or a dependency of an affected project);
+      # tests only run when the project is *affected*.
+      - template: ../jobs/node-package.yml
+        parameters:
+          jobName: Build_contracts
+          displayName: contracts (TS client)
+          project:
+            key: contracts
+            name: contracts
+            path: packages/contracts
+
+      - template: ../jobs/node-package.yml
+        parameters:
+          jobName: Build_shared_utils
+          displayName: shared-utils
+          dependsOn: [Build_contracts]
+          project:
+            key: shared_utils
+            name: shared-utils
+            path: packages/shared-utils
+          artifactDeps:
+            - name: contracts
+              path: packages/contracts
+
+      - template: ../jobs/node-package.yml
+        parameters:
+          jobName: Build_ui_kit
+          displayName: ui-kit
+          dependsOn: [Build_contracts, Build_shared_utils]
+          project:
+            key: ui_kit
+            name: ui-kit
+            path: packages/ui-kit
+          artifactDeps:
+            - name: contracts
+              path: packages/contracts
+            - name: shared-utils
+              path: packages/shared-utils
+
+      - template: ../jobs/node-package.yml
+        parameters:
+          jobName: Build_web
+          displayName: web
+          dependsOn: [Build_contracts, Build_shared_utils, Build_ui_kit]
+          project:
+            key: web
+            name: web
+            path: apps/web
+          artifactDeps:
+            - name: contracts
+              path: packages/contracts
+            - name: shared-utils
+              path: packages/shared-utils
+            - name: ui-kit
+              path: packages/ui-kit
+          buildCommand: pnpm run build
+          postBuildSteps:
+            - script: pnpm run size
+              displayName: Bundle size budget (size-limit)
+              workingDirectory: $(Build.SourcesDirectory)/apps/web
+            - script: pnpm dlx @lhci/cli@0.14.x autorun --config=lighthouserc.json
+              displayName: Lighthouse CI budgets
+              workingDirectory: $(Build.SourcesDirectory)/apps/web
+              condition: and(succeeded(), eq(variables.runTests, 'true'))
+
+      # ------------------------------------------------------------- .NET
+      - template: ../jobs/dotnet-service.yml
+        parameters:
+          jobName: Build_api
+          displayName: api (.NET)
+          project:
+            key: api
+            name: api
+            path: services/api
+            solution: services/api/Acme.Api.sln
+          publishProject: services/api/src/Acme.Api/Acme.Api.csproj
+          efProject: services/api/src/Acme.Api.Data/Acme.Api.Data.csproj
+
+      # ------------------------------------------------------------- Go
+      - template: ../jobs/go-service.yml
+        parameters:
+          jobName: Build_worker
+          displayName: worker (Go)
+          project:
+            key: worker
+            name: worker
+            path: services/worker
+          mainPackage: ./cmd/worker

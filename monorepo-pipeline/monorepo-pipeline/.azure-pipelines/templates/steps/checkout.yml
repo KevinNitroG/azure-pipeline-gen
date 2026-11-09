@@ -1,0 +1,14 @@
+parameters:
+  - name: fetchDepth
+    type: number
+    default: 1
+  - name: persistCredentials
+    type: boolean
+    default: false
+
+steps:
+  - checkout: self
+    clean: true
+    fetchDepth: ${{ parameters.fetchDepth }}
+    fetchTags: ${{ eq(parameters.fetchDepth, 0) }}
+    persistCredentials: ${{ parameters.persistCredentials }}

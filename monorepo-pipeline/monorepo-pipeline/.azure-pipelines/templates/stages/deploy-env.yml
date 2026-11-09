@@ -1,0 +1,181 @@
+# One stage per entry in `environments` (compile-time loop). Each stage:
+#   InfraPlan -> InfraApply -> Migrate -> Deploy_api / Deploy_worker -> Deploy_web -> Smoke -> [LoadTest]
+# Every job is individually skipped when its project is not affected.
+parameters:
+  - name: environments
+    type: object
+  - name: deployUpTo
+    type: string
+  - name: runE2E
+    type: boolean
+  - name: runLoadTests
+    type: boolean
+
+stages:
+  - ${{ each env in parameters.environments }}:
+      - ${{ if containsValue(env.targets, parameters.deployUpTo) }}:
+          - stage: Deploy${{ env.stageName }}
+            displayName: Deploy to ${{ env.displayName }}
+            # Depend on EVERY upstream stage so a failure anywhere blocks promotion
+            # (a merely "skipped" stage must never be mistaken for a green one).
+            dependsOn:
+              - Detect
+              - Codegen
+              - Quality
+              - BuildTest
+              - Integration
+              - Package
+              - ${{ if eq(parameters.runE2E, true) }}:
+                  - E2E
+              - ${{ each prev in env.previousStages }}:
+                  - ${{ prev }}
+            condition: and(not(failed()), not(canceled()), ne(variables['Build.Reason'], 'PullRequest'), eq(dependencies.Detect.outputs['Plan.plan.deploy_any'], 'true'), ${{ env.branchCondition }})
+            variables:
+              - group: acme-platform-${{ env.name }}
+            jobs:
+              # ---------------------------------------------------------- infrastructure
+              - job: InfraPlan
+                displayName: Bicep what-if
+                condition: and(not(failed()), not(canceled()), eq(stageDependencies.Detect.Plan.outputs['plan.affected_infra'], 'true'))
+                pool:
+                  vmImage: ubuntu-24.04
+                steps:
+                  - checkout: self
+                    fetchDepth: 1
+                  - task: AzureCLI@2
+                    displayName: az deployment group what-if
+                    inputs:
+                      azureSubscription: ${{ env.serviceConnection }}
+                      scriptType: bash
+                      scriptLocation: inlineScript
+                      workingDirectory: $(Build.SourcesDirectory)
+                      inlineScript: |
+                        set -euo pipefail
+                        az deployment group what-if \
+                          --resource-group "${{ env.resourceGroup }}" \
+                          --template-file infra/main.bicep \
+                          --parameters infra/params/${{ env.name }}.bicepparam \
+                          --no-pretty-print --result-format ResourceIdOnly | tee "$(Agent.TempDirectory)/whatif.txt"
+                        echo "##vso[task.uploadsummary]$(Agent.TempDirectory)/whatif.txt"
+
+              - deployment: InfraApply
+                displayName: Bicep deploy
+                dependsOn: InfraPlan
+                condition: and(not(failed()), not(canceled()), eq(stageDependencies.Detect.Plan.outputs['plan.affected_infra'], 'true'))
+                pool:
+                  vmImage: ubuntu-24.04
+                environment: ${{ env.environment }}-infra
+                strategy:
+                  runOnce:
+                    deploy:
+                      steps:
+                        - checkout: self
+                          fetchDepth: 1
+                        - task: AzureCLI@2
+                          displayName: az deployment group create
+                          inputs:
+                            azureSubscription: ${{ env.serviceConnection }}
+                            scriptType: bash
+                            scriptLocation: inlineScript
+                            workingDirectory: $(Build.SourcesDirectory)
+                            inlineScript: |
+                              set -euo pipefail
+                              az deployment group create \
+                                --name "acme-$(Build.BuildId)" \
+                                --resource-group "${{ env.resourceGroup }}" \
+                                --template-file infra/main.bicep \
+                                --parameters infra/params/${{ env.name }}.bicepparam
+
+              # ---------------------------------------------------------- database migrations
+              - job: Migrate
+                displayName: EF migrations bundle
+                dependsOn: InfraApply
+                condition: and(not(failed()), not(canceled()), eq(stageDependencies.Detect.Plan.outputs['plan.affected_api'], 'true'))
+                pool:
+                  vmImage: ubuntu-24.04
+                steps:
+                  - checkout: none
+                  - download: current
+                    artifact: ef-bundle
+                  - task: AzureKeyVault@2
+                    displayName: Fetch connection string
+                    inputs:
+                      azureSubscription: ${{ env.serviceConnection }}
+                      KeyVaultName: ${{ env.keyVault }}
+                      SecretsFilter: sql-connection-string
+                      RunAsPreJob: false
+                  - bash: |
+                      set -euo pipefail
+                      chmod +x "$(Pipeline.Workspace)/ef-bundle/efbundle"
+                      "$(Pipeline.Workspace)/ef-bundle/efbundle" --connection "$SQL_CONN"
+                    displayName: Apply migrations
+                    env:
+                      SQL_CONN: $(sql-connection-string)
+
+              # ---------------------------------------------------------- services
+              - template: ../jobs/deploy-service.yml
+                parameters:
+                  env: ${{ env }}
+                  service:
+                    name: api
+                    key: api
+                  dependsOn: [Migrate]
+
+              - template: ../jobs/deploy-service.yml
+                parameters:
+                  env: ${{ env }}
+                  service:
+                    name: worker
+                    key: worker
+                  dependsOn: [Migrate]
+
+              - template: ../jobs/deploy-web.yml
+                parameters:
+                  env: ${{ env }}
+                  dependsOn: [Deploy_api]
+
+              # ---------------------------------------------------------- verification
+              - job: Smoke
+                displayName: Post-deploy smoke tests
+                dependsOn: [Deploy_api, Deploy_worker, Deploy_web]
+                condition: and(not(failed()), not(canceled()), eq(stageDependencies.Detect.Plan.outputs['plan.deploy_any'], 'true'))
+                pool:
+                  vmImage: ubuntu-24.04
+                steps:
+                  - template: ../steps/checkout.yml
+                  - template: ../steps/setup-node.yml
+                    parameters:
+                      filter: ./tests/e2e...
+                  - bash: |
+                      set -euo pipefail
+                      curl --retry 12 --retry-delay 5 --retry-all-errors --fail -s "${{ env.apiUrl }}/healthz"
+                      curl --retry 12 --retry-delay 5 --retry-all-errors --fail -s "${{ env.webUrl }}/config.json"
+                    displayName: Health endpoints
+                  - bash: pnpm --filter ./tests/e2e exec playwright install --with-deps chromium
+                    displayName: Install browsers
+                  - bash: pnpm --filter ./tests/e2e exec playwright test --project=smoke --reporter=junit
+                    displayName: Playwright smoke project
+                    env:
+                      BASE_URL: ${{ env.webUrl }}
+                      PLAYWRIGHT_JUNIT_OUTPUT_FILE: $(Build.SourcesDirectory)/tests/e2e/test-results/smoke.xml
+                  - task: PublishTestResults@2
+                    condition: succeededOrFailed()
+                    inputs:
+                      testResultsFormat: JUnit
+                      testResultsFiles: tests/e2e/test-results/smoke.xml
+                      searchFolder: $(Build.SourcesDirectory)
+                      testRunTitle: smoke ${{ env.name }}
+
+              - ${{ if and(eq(env.loadTest, true), eq(parameters.runLoadTests, true)) }}:
+                  - job: LoadTest
+                    displayName: k6 load test with thresholds
+                    dependsOn: Smoke
+                    pool:
+                      vmImage: ubuntu-24.04
+                    steps:
+                      - checkout: self
+                        fetchDepth: 1
+                      - bash: |
+                          docker run --rm -i -e BASE_URL="${{ env.apiUrl }}" \
+                            -v "$PWD/tests/load:/scripts:ro" grafana/k6:0.54.0 run /scripts/baseline.js
+                        displayName: k6 run baseline.js

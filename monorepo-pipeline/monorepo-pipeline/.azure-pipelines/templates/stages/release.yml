@@ -1,0 +1,131 @@
+parameters:
+  - name: runE2E
+    type: boolean
+    default: true
+  - name: publishPackages
+    type: boolean
+    default: true
+  - name: packages
+    type: object
+    default:
+      - name: contracts
+        path: packages/contracts
+      - name: shared-utils
+        path: packages/shared-utils
+      - name: ui-kit
+        path: packages/ui-kit
+
+stages:
+  - stage: Release
+    displayName: Release (tag, publish packages, notes)
+    dependsOn:
+      - Detect
+      - Codegen
+      - Quality
+      - BuildTest
+      - Integration
+      - Docs
+      - Package
+      - ${{ if eq(parameters.runE2E, true) }}:
+          - E2E
+      - DeployDev
+      - DeployStaging
+      - DeployProd
+    condition: and(not(failed()), not(canceled()), ne(variables['Build.Reason'], 'PullRequest'), eq(dependencies.Detect.outputs['Plan.plan.release_any'], 'true'), or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/')))
+    variables:
+      - group: acme-platform-shared
+    jobs:
+      - job: Tag
+        displayName: Create git tag
+        variables:
+          releaseVersion: $[ stageDependencies.Detect.Version.outputs['ver.releaseVersion'] ]
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - template: ../steps/checkout.yml
+            parameters:
+              fetchDepth: 0
+              persistCredentials: true
+          - bash: |
+              set -euo pipefail
+              git config user.email "ci@acme.example.com"
+              git config user.name "Azure Pipelines"
+              if git rev-parse -q --verify "refs/tags/v$(releaseVersion)" > /dev/null; then
+                echo "Tag v$(releaseVersion) already exists"; exit 0
+              fi
+              git tag -a "v$(releaseVersion)" -m "Release $(releaseVersion) (build $(Build.BuildNumber))"
+              git push origin "v$(releaseVersion)"
+            displayName: Tag v$(releaseVersion)
+
+      - job: Notes
+        displayName: Changelog (git-cliff)
+        dependsOn: Tag
+        variables:
+          releaseVersion: $[ stageDependencies.Detect.Version.outputs['ver.releaseVersion'] ]
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - template: ../steps/checkout.yml
+            parameters:
+              fetchDepth: 0
+          - bash: |
+              set -euo pipefail
+              mkdir -p "$(Build.ArtifactStagingDirectory)/notes"
+              docker run --rm -v "$PWD:/app" -w /app orhunp/git-cliff:2.6.1 \
+                --latest --tag "v$(releaseVersion)" -o "$(Build.ArtifactStagingDirectory)/notes/RELEASE_NOTES.md"
+            displayName: Generate release notes
+          - publish: $(Build.ArtifactStagingDirectory)/notes
+            artifact: release-notes
+
+      - ${{ if eq(parameters.publishPackages, true) }}:
+          - ${{ each pkg in parameters.packages }}:
+              - job: Npm_${{ replace(pkg.name, '-', '_') }}
+                displayName: npm publish @acme/${{ pkg.name }}
+                dependsOn: Tag
+                condition: and(succeeded(), eq(stageDependencies.Detect.Plan.outputs['plan.affected_${{ replace(pkg.name, '-', '_') }}'], 'true'))
+                variables:
+                  releaseVersion: $[ stageDependencies.Detect.Version.outputs['ver.releaseVersion'] ]
+                pool:
+                  vmImage: ubuntu-24.04
+                steps:
+                  - template: ../steps/checkout.yml
+                  - template: ../steps/setup-node.yml
+                    parameters:
+                      filter: ./${{ pkg.path }}...
+                  - template: ../steps/download-generated.yml
+                  - task: DownloadPipelineArtifact@2
+                    displayName: Download pkg-${{ pkg.name }}
+                    inputs:
+                      buildType: current
+                      artifactName: pkg-${{ pkg.name }}
+                      targetPath: $(Build.SourcesDirectory)/${{ pkg.path }}/dist
+                  - bash: |
+                      set -euo pipefail
+                      pnpm version "$(releaseVersion)" --no-git-tag-version
+                      pnpm publish --no-git-checks --access restricted
+                    displayName: pnpm publish $(releaseVersion)
+                    workingDirectory: $(Build.SourcesDirectory)/${{ pkg.path }}
+
+          - job: NuGet_Contracts
+            displayName: dotnet pack and push Acme.Contracts
+            dependsOn: Tag
+            condition: and(succeeded(), eq(stageDependencies.Detect.Plan.outputs['plan.affected_contracts'], 'true'))
+            variables:
+              releaseVersion: $[ stageDependencies.Detect.Version.outputs['ver.releaseVersion'] ]
+            pool:
+              vmImage: ubuntu-24.04
+            steps:
+              - template: ../steps/checkout.yml
+              - template: ../steps/setup-dotnet.yml
+              - template: ../steps/download-generated.yml
+              - bash: >
+                  dotnet pack packages/contracts/generated/csharp/src/Acme.Contracts/Acme.Contracts.csproj
+                  -c Release -p:Version=$(releaseVersion) -o "$(Build.ArtifactStagingDirectory)/nuget"
+                displayName: dotnet pack
+              - task: DotNetCoreCLI@2
+                displayName: Push to internal feed
+                inputs:
+                  command: push
+                  packagesToPush: $(Build.ArtifactStagingDirectory)/nuget/*.nupkg
+                  nuGetFeedType: internal
+                  publishVstsFeed: $(nugetFeed)

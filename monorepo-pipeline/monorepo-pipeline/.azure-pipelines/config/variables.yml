@@ -1,0 +1,37 @@
+# Shared, non-secret variables. Included by azure-pipelines.yml and by the
+# standalone pipelines under .azure-pipelines/pipelines/.
+variables:
+  # ---- toolchain -----------------------------------------------------------
+  - name: nodeVersion
+    value: 20.x
+  - name: pnpmVersion
+    value: 9.12.3
+  - name: goVersion
+    value: 1.23.x
+  # .NET SDK version comes from global.json (UseDotNet useGlobalJson)
+
+  # ---- registries / feeds --------------------------------------------------
+  - name: acrName
+    value: acmeplatformacr
+  - name: acrServiceConnection
+    value: sc-acme-acr
+  - name: nugetFeed
+    value: acme-platform/platform-packages
+
+  # ---- caches (paths are consumed by Cache@2 steps) ------------------------
+  - name: npm_config_store_dir
+    value: $(Pipeline.Workspace)/.pnpm-store
+  - name: NUGET_PACKAGES
+    value: $(Pipeline.Workspace)/.nuget/packages
+  - name: GOMODCACHE
+    value: $(Pipeline.Workspace)/.gomod
+
+  # ---- tool noise ----------------------------------------------------------
+  - name: CI
+    value: true
+  - name: DOTNET_NOLOGO
+    value: true
+  - name: DOTNET_CLI_TELEMETRY_OPTOUT
+    value: true
+  - name: DOTNET_SKIP_FIRST_TIME_EXPERIENCE
+    value: true

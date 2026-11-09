@@ -1,0 +1,50 @@
+# "Build once, deploy many": the same pkg-web artifact is promoted through every environment;
+# only config.json (runtime config) is generated per environment.
+parameters:
+  - name: env
+    type: object
+  - name: dependsOn
+    type: object
+    default: []
+
+jobs:
+  - deployment: Deploy_web
+    displayName: web to ${{ parameters.env.name }} (Static Web Apps)
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: and(not(failed()), not(canceled()), eq(stageDependencies.Detect.Plan.outputs['plan.affected_web'], 'true'))
+    pool:
+      vmImage: ubuntu-24.04
+    environment: ${{ parameters.env.environment }}
+    variables:
+      semver: $[ stageDependencies.Detect.Version.outputs['ver.semver'] ]
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+              fetchDepth: 1
+            - task: DownloadPipelineArtifact@2
+              displayName: Download pkg-web
+              inputs:
+                buildType: current
+                artifactName: pkg-web
+                targetPath: $(System.DefaultWorkingDirectory)/web-dist
+            - bash: |
+                set -euo pipefail
+                cat > web-dist/config.json <<JSON
+                {
+                  "environment": "${{ parameters.env.name }}",
+                  "apiBaseUrl": "${{ parameters.env.apiUrl }}",
+                  "version": "$(semver)"
+                }
+                JSON
+              displayName: Write runtime config.json
+              workingDirectory: $(System.DefaultWorkingDirectory)
+            - task: AzureStaticWebApp@0
+              displayName: Deploy to Static Web Apps
+              inputs:
+                app_location: web-dist
+                skip_app_build: true
+                skip_api_build: true
+                azure_static_web_apps_api_token: $(swaToken)
+                deployment_environment: ${{ parameters.env.swaSlot }}

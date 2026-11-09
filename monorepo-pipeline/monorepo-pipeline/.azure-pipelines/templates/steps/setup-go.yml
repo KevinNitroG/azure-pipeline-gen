@@ -1,0 +1,13 @@
+steps:
+  - task: GoTool@0
+    displayName: Use Go $(goVersion)
+    inputs:
+      version: $(goVersion)
+
+  - task: Cache@2
+    displayName: Cache Go modules
+    inputs:
+      key: 'go | "$(Agent.OS)" | **/go.sum'
+      restoreKeys: |
+        go | "$(Agent.OS)"
+      path: $(GOMODCACHE)

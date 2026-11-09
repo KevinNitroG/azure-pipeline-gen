@@ -1,0 +1,63 @@
+# Shared by the main CI pipeline (Docs stage) and pipelines/docs-scheduled.yml.
+# Expects generated sources to be already placed (see download-generated.yml).
+parameters:
+  - name: version
+    type: string
+    default: $(Build.BuildNumber)
+  - name: xmlDocsDir
+    type: string
+    default: $(Pipeline.Workspace)/docs-api-xml
+  - name: artifactName
+    type: string
+    default: docs-site
+
+steps:
+  - template: setup-node.yml
+    parameters:
+      filter: ./docs...
+
+  - task: UseDotNet@2
+    displayName: Use .NET 8 (docfx)
+    inputs:
+      packageType: sdk
+      version: 8.x
+
+  - bash: pnpm dlx markdownlint-cli2 "docs/**/*.md" "#docs/node_modules"
+    displayName: Lint markdown
+    workingDirectory: $(Build.SourcesDirectory)
+
+  - bash: pnpm run docs:typedoc
+    displayName: TypeDoc (shared-utils, ui-kit, contracts)
+    workingDirectory: $(Build.SourcesDirectory)
+
+  - bash: |
+      set -euo pipefail
+      pnpm dlx @redocly/cli build-docs \
+        packages/contracts/generated/openapi/bundled.yaml \
+        --output docs/static/api/index.html
+    displayName: Redocly - HTTP API reference
+    workingDirectory: $(Build.SourcesDirectory)
+
+  - bash: |
+      set -euo pipefail
+      if compgen -G "${{ parameters.xmlDocsDir }}/*.xml" > /dev/null; then
+        mkdir -p docs/dotnet/xml
+        cp ${{ parameters.xmlDocsDir }}/*.xml docs/dotnet/xml/
+        dotnet tool install -g docfx
+        export PATH="$PATH:$HOME/.dotnet/tools"
+        docfx docs/dotnet/docfx.json
+      else
+        echo "##vso[task.logissue type=warning]No .NET XML docs found - skipping docfx"
+      fi
+    displayName: DocFX - .NET API reference
+    workingDirectory: $(Build.SourcesDirectory)
+
+  - bash: pnpm --filter "./docs" run build
+    displayName: Docusaurus build
+    workingDirectory: $(Build.SourcesDirectory)
+    env:
+      DOCS_VERSION: ${{ parameters.version }}
+
+  - publish: $(Build.SourcesDirectory)/docs/build
+    artifact: ${{ parameters.artifactName }}
+    displayName: Publish ${{ parameters.artifactName }}

@@ -1,0 +1,48 @@
+# Node + pnpm + cached store + (optionally) a filtered, frozen install.
+# filter examples:  "./apps/web..."  (project + its workspace deps)
+parameters:
+  - name: filter
+    type: string
+    default: ''
+  - name: install
+    type: boolean
+    default: true
+  - name: authenticateFeed
+    type: boolean
+    default: true
+
+steps:
+  - task: NodeTool@0
+    displayName: Use Node $(nodeVersion)
+    inputs:
+      versionSpec: $(nodeVersion)
+
+  - script: |
+      corepack enable
+      corepack prepare pnpm@$(pnpmVersion) --activate
+      pnpm --version
+    displayName: Activate pnpm $(pnpmVersion)
+
+  - ${{ if eq(parameters.authenticateFeed, true) }}:
+      - task: npmAuthenticate@0
+        displayName: Authenticate Azure Artifacts feed
+        inputs:
+          workingFile: $(Build.SourcesDirectory)/.npmrc
+
+  - task: Cache@2
+    displayName: Cache pnpm store
+    inputs:
+      key: 'pnpm | "$(Agent.OS)" | pnpm-lock.yaml'
+      restoreKeys: |
+        pnpm | "$(Agent.OS)"
+      path: $(npm_config_store_dir)
+
+  - ${{ if eq(parameters.install, true) }}:
+      - ${{ if ne(parameters.filter, '') }}:
+          - script: pnpm install --frozen-lockfile --prefer-offline --filter "${{ parameters.filter }}"
+            displayName: pnpm install (${{ parameters.filter }})
+            workingDirectory: $(Build.SourcesDirectory)
+      - ${{ else }}:
+          - script: pnpm install --frozen-lockfile --prefer-offline
+            displayName: pnpm install (workspace)
+            workingDirectory: $(Build.SourcesDirectory)

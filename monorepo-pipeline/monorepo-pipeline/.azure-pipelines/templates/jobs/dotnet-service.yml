@@ -1,0 +1,122 @@
+parameters:
+  - name: jobName
+    type: string
+  - name: displayName
+    type: string
+  - name: project
+    type: object
+  - name: dependsOn
+    type: object
+    default: []
+  - name: publishProject
+    type: string
+  - name: efProject
+    type: string
+    default: ''
+  - name: testFilter
+    type: string
+    default: Category!=Integration
+
+jobs:
+  - job: ${{ parameters.jobName }}
+    displayName: ${{ parameters.displayName }}
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: and(succeeded(), eq(stageDependencies.Detect.Plan.outputs['plan.needed_${{ parameters.project.key }}'], 'true'))
+    timeoutInMinutes: 40
+    pool:
+      vmImage: ubuntu-24.04
+    variables:
+      runTests: $[ stageDependencies.Detect.Plan.outputs['plan.affected_${{ parameters.project.key }}'] ]
+      semver: $[ stageDependencies.Detect.Version.outputs['ver.semver'] ]
+    steps:
+      - template: ../steps/checkout.yml
+      - template: ../steps/setup-dotnet.yml
+      - template: ../steps/download-generated.yml
+
+      - script: dotnet restore "${{ parameters.project.solution }}"
+        displayName: Restore
+        workingDirectory: $(Build.SourcesDirectory)
+
+      - script: >
+          dotnet build "${{ parameters.project.solution }}" -c Release --no-restore
+          -warnaserror
+          -p:ContinuousIntegrationBuild=true
+          -p:GenerateDocumentationFile=true
+          -p:Version=$(semver)
+        displayName: Build (warnings are errors)
+        workingDirectory: $(Build.SourcesDirectory)
+
+      - script: >
+          dotnet test "${{ parameters.project.solution }}" -c Release --no-build
+          --filter "${{ parameters.testFilter }}"
+          --collect:"XPlat Code Coverage"
+          --logger "trx;LogPrefix=false"
+          --results-directory "$(Agent.TempDirectory)/trx"
+        displayName: Unit tests (affected only)
+        condition: and(succeeded(), eq(variables.runTests, 'true'))
+        workingDirectory: $(Build.SourcesDirectory)
+
+      - task: PublishTestResults@2
+        displayName: Publish test results
+        condition: and(succeededOrFailed(), eq(variables.runTests, 'true'))
+        inputs:
+          testResultsFormat: VSTest
+          testResultsFiles: '*.trx'
+          searchFolder: $(Agent.TempDirectory)/trx
+          testRunTitle: ${{ parameters.project.name }} (dotnet)
+          mergeTestResults: true
+
+      - bash: |
+          set -euo pipefail
+          dotnet tool install -g dotnet-reportgenerator-globaltool
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          reportgenerator -reports:"$(Agent.TempDirectory)/trx/**/coverage.cobertura.xml" \
+            -targetdir:"$(Agent.TempDirectory)/coverage" -reporttypes:Cobertura
+        displayName: Merge coverage
+        condition: and(succeeded(), eq(variables.runTests, 'true'))
+
+      - task: PublishCodeCoverageResults@2
+        displayName: Publish coverage
+        condition: and(succeeded(), eq(variables.runTests, 'true'))
+        inputs:
+          summaryFileLocation: $(Agent.TempDirectory)/coverage/Cobertura.xml
+          failIfCoverageEmpty: false
+
+      - script: >
+          dotnet publish "${{ parameters.publishProject }}" -c Release --no-build
+          -o "$(Build.ArtifactStagingDirectory)/svc"
+        displayName: dotnet publish
+        workingDirectory: $(Build.SourcesDirectory)
+
+      - ${{ if ne(parameters.efProject, '') }}:
+          - bash: |
+              set -euo pipefail
+              dotnet tool install -g dotnet-ef
+              export PATH="$PATH:$HOME/.dotnet/tools"
+              dotnet ef migrations bundle \
+                --project "${{ parameters.efProject }}" \
+                --startup-project "${{ parameters.publishProject }}" \
+                --configuration Release --no-build --self-contained -r linux-x64 --force \
+                -o "$(Build.ArtifactStagingDirectory)/ef-bundle/efbundle"
+            displayName: Build EF migrations bundle
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - publish: $(Build.ArtifactStagingDirectory)/ef-bundle
+            artifact: ef-bundle
+            displayName: Publish ef-bundle
+
+      - bash: |
+          set -euo pipefail
+          mkdir -p "$(Build.ArtifactStagingDirectory)/xmldocs"
+          find "${{ parameters.project.path }}" -path '*/bin/Release/*' -name '*.xml' \
+            -not -name '*.deps.json' -exec cp {} "$(Build.ArtifactStagingDirectory)/xmldocs/" \;
+        displayName: Collect XML docs
+        workingDirectory: $(Build.SourcesDirectory)
+
+      - publish: $(Build.ArtifactStagingDirectory)/xmldocs
+        artifact: docs-api-xml
+        displayName: Publish docs-api-xml
+
+      - publish: $(Build.ArtifactStagingDirectory)/svc
+        artifact: svc-${{ parameters.project.name }}
+        displayName: Publish svc-${{ parameters.project.name }}

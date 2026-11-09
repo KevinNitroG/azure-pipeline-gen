@@ -1,0 +1,101 @@
+{
+  "$comment": "Single source of truth for the monorepo dependency graph. Used by detect-changes.js (affected/needed computation) and validate-graph.js (drift check against package.json / *.csproj). dependsOn must list the TRANSITIVE closure.",
+  "codegenRoot": "contracts",
+
+  "projects": {
+    "contracts": {
+      "kind": "node",
+      "path": "packages/contracts",
+      "packageName": "@acme/contracts",
+      "publish": true,
+      "dependsOn": []
+    },
+    "shared-utils": {
+      "kind": "node",
+      "path": "packages/shared-utils",
+      "packageName": "@acme/shared-utils",
+      "publish": true,
+      "dependsOn": ["contracts"]
+    },
+    "ui-kit": {
+      "kind": "node",
+      "path": "packages/ui-kit",
+      "packageName": "@acme/ui-kit",
+      "publish": true,
+      "dependsOn": ["shared-utils", "contracts"]
+    },
+    "web": {
+      "kind": "node",
+      "path": "apps/web",
+      "packageName": "@acme/web",
+      "deployable": true,
+      "dependsOn": ["ui-kit", "shared-utils", "contracts"]
+    },
+    "api": {
+      "kind": "dotnet",
+      "path": "services/api",
+      "solution": "services/api/Acme.Api.sln",
+      "deployable": true,
+      "image": {
+        "repository": "acme/api",
+        "dockerfile": "services/api/Dockerfile",
+        "context": "services/api"
+      },
+      "dependsOn": ["contracts"]
+    },
+    "worker": {
+      "kind": "go",
+      "path": "services/worker",
+      "deployable": true,
+      "image": {
+        "repository": "acme/worker",
+        "dockerfile": "services/worker/Dockerfile",
+        "context": "services/worker"
+      },
+      "dependsOn": ["contracts"]
+    },
+    "e2e": {
+      "kind": "node",
+      "path": "tests/e2e",
+      "packageName": "@acme/e2e",
+      "dependsOn": ["web", "api", "worker", "ui-kit", "shared-utils", "contracts"]
+    },
+    "docs": {
+      "kind": "docs",
+      "path": "docs",
+      "dependsOn": ["contracts", "ui-kit", "shared-utils", "api"]
+    },
+    "infra": {
+      "kind": "bicep",
+      "path": "infra",
+      "dependsOn": []
+    }
+  },
+
+  "rules": [
+    {
+      "$comment": "Workspace-wide JS tooling",
+      "match": ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", ".npmrc", "tsconfig.base.json", "eslint.config.*", ".prettierrc*", ".dependency-cruiser.cjs"],
+      "affects": ["contracts", "shared-utils", "ui-kit", "web", "e2e", "docs"]
+    },
+    {
+      "match": ["Directory.Build.props", "Directory.Packages.props", "global.json", "nuget.config"],
+      "affects": ["api"]
+    },
+    {
+      "match": ["go.work", "go.work.sum", ".golangci.yml"],
+      "affects": ["worker"]
+    },
+    {
+      "$comment": "Helm charts / env values / compose files redeploy the apps",
+      "match": ["deploy/**"],
+      "affects": ["api", "worker", "web", "e2e"]
+    },
+    {
+      "match": [".editorconfig", "azure-pipelines.yml", ".azure-pipelines/**"],
+      "affects": ["*"]
+    }
+  ],
+
+  "ignore": ["README.md", "LICENSE", "CODEOWNERS", ".github/**", ".vscode/**", "**/.DS_Store"]
+}

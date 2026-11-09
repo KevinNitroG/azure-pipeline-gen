@@ -1,0 +1,85 @@
+# Build (+ test, when affected) one pnpm workspace project.
+# Upstream workspace packages are NOT rebuilt: their dist/ is pulled from the
+# `pkg-<name>` artifact published by their own job in the same stage.
+parameters:
+  - name: jobName
+    type: string
+  - name: displayName
+    type: string
+  - name: project             # { key, name, path }
+    type: object
+  - name: dependsOn
+    type: object
+    default: []
+  - name: artifactDeps        # [{ name, path }]
+    type: object
+    default: []
+  - name: buildCommand
+    type: string
+    default: pnpm run build
+  - name: testCommand
+    type: string
+    default: pnpm run test:ci
+  - name: postBuildSteps
+    type: stepList
+    default: []
+
+jobs:
+  - job: ${{ parameters.jobName }}
+    displayName: ${{ parameters.displayName }}
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: and(succeeded(), eq(stageDependencies.Detect.Plan.outputs['plan.needed_${{ parameters.project.key }}'], 'true'))
+    timeoutInMinutes: 30
+    pool:
+      vmImage: ubuntu-24.04
+    variables:
+      runTests: $[ stageDependencies.Detect.Plan.outputs['plan.affected_${{ parameters.project.key }}'] ]
+      semver: $[ stageDependencies.Detect.Version.outputs['ver.semver'] ]
+    steps:
+      - template: ../steps/checkout.yml
+      - template: ../steps/setup-node.yml
+        parameters:
+          filter: ./${{ parameters.project.path }}...
+      - template: ../steps/download-generated.yml
+
+      - ${{ each dep in parameters.artifactDeps }}:
+          - task: DownloadPipelineArtifact@2
+            displayName: Fetch ${{ dep.name }} build output
+            inputs:
+              buildType: current
+              artifactName: pkg-${{ dep.name }}
+              targetPath: $(Build.SourcesDirectory)/${{ dep.path }}/dist
+
+      - script: ${{ parameters.buildCommand }}
+        displayName: Build ${{ parameters.project.name }}
+        workingDirectory: $(Build.SourcesDirectory)/${{ parameters.project.path }}
+        env:
+          APP_VERSION: $(semver)
+
+      - script: ${{ parameters.testCommand }}
+        displayName: Test ${{ parameters.project.name }} (affected only)
+        condition: and(succeeded(), eq(variables.runTests, 'true'))
+        workingDirectory: $(Build.SourcesDirectory)/${{ parameters.project.path }}
+
+      - task: PublishTestResults@2
+        displayName: Publish test results
+        condition: and(succeededOrFailed(), eq(variables.runTests, 'true'))
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: ${{ parameters.project.path }}/test-results/junit.xml
+          searchFolder: $(Build.SourcesDirectory)
+          testRunTitle: ${{ parameters.project.name }} (node)
+          mergeTestResults: true
+
+      - task: PublishCodeCoverageResults@2
+        displayName: Publish coverage
+        condition: and(succeededOrFailed(), eq(variables.runTests, 'true'))
+        inputs:
+          summaryFileLocation: $(Build.SourcesDirectory)/${{ parameters.project.path }}/coverage/cobertura-coverage.xml
+          failIfCoverageEmpty: false
+
+      - ${{ parameters.postBuildSteps }}
+
+      - publish: $(Build.SourcesDirectory)/${{ parameters.project.path }}/dist
+        artifact: pkg-${{ parameters.project.name }}
+        displayName: Publish pkg-${{ parameters.project.name }}

@@ -1,0 +1,138 @@
+# The whole stage graph lives here; azure-pipelines.yml only supplies triggers, resources and flags.
+#
+#  Detect --> Codegen --+--> Quality ----------+
+#                       |                      +--> Package --> E2E --> DeployDev --> DeployStaging --> DeployProd --> Release
+#                       +--> BuildTest --> Integration -+
+#                       |        |
+#                       +--------+--> Docs (preview on PR, publish on main)
+#                                                                                         Notify (always)
+parameters:
+  - name: forceAll
+    type: boolean
+    default: false
+  - name: deployUpTo
+    type: string
+    default: prod
+  - name: runE2E
+    type: boolean
+    default: true
+  - name: runLoadTests
+    type: boolean
+    default: false
+  - name: enableCodeQL
+    type: boolean
+    default: false
+  - name: publishPackages
+    type: boolean
+    default: true
+  - name: deployDocs
+    type: boolean
+    default: true
+  - name: e2eShards
+    type: object
+    default: [1, 2, 3, 4]
+
+  # ---- environment topology (compile-time) ------------------------------------------------------
+  - name: environments
+    type: object
+    default:
+      - name: dev
+        stageName: Dev
+        displayName: Development
+        environment: acme-dev                 # Azure DevOps Environment (add approvals/checks in the UI)
+        targets: [dev, staging, prod]         # included when deployUpTo is one of these
+        previousStages: []
+        serviceConnection: sc-acme-dev
+        resourceGroup: rg-acme-dev
+        aksCluster: aks-acme-dev
+        keyVault: kv-acme-dev
+        namespace: acme
+        apiUrl: https://api.dev.acme.example.com
+        webUrl: https://dev.acme.example.com
+        swaSlot: production
+        strategy: runOnce
+        canaryIncrements: []
+        loadTest: false
+        branchCondition: ne(variables['Build.Reason'], 'PullRequest')
+      - name: staging
+        stageName: Staging
+        displayName: Staging
+        environment: acme-staging
+        targets: [staging, prod]
+        previousStages: [DeployDev]
+        serviceConnection: sc-acme-staging
+        resourceGroup: rg-acme-staging
+        aksCluster: aks-acme-staging
+        keyVault: kv-acme-staging
+        namespace: acme
+        apiUrl: https://api.staging.acme.example.com
+        webUrl: https://staging.acme.example.com
+        swaSlot: production
+        strategy: runOnce
+        canaryIncrements: []
+        loadTest: true
+        branchCondition: or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/'), startsWith(variables['Build.SourceBranch'], 'refs/heads/hotfix/'))
+      - name: prod
+        stageName: Prod
+        displayName: Production
+        environment: acme-prod
+        targets: [prod]
+        previousStages: [DeployDev, DeployStaging]
+        serviceConnection: sc-acme-prod
+        resourceGroup: rg-acme-prod
+        aksCluster: aks-acme-prod
+        keyVault: kv-acme-prod
+        namespace: acme
+        apiUrl: https://api.acme.example.com
+        webUrl: https://www.acme.example.com
+        swaSlot: production
+        strategy: canary
+        canaryIncrements: [10, 50]
+        loadTest: false
+        branchCondition: or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/'), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))
+
+stages:
+  - template: ../stages/detect.yml
+    parameters:
+      forceAll: ${{ parameters.forceAll }}
+
+  - template: ../stages/codegen.yml
+
+  - template: ../stages/quality.yml
+    parameters:
+      enableCodeQL: ${{ parameters.enableCodeQL }}
+
+  - template: ../stages/build-test.yml
+
+  - template: ../stages/integration.yml
+
+  - template: ../stages/docs.yml
+    parameters:
+      deployDocs: ${{ parameters.deployDocs }}
+
+  - template: ../stages/package.yml
+
+  - ${{ if eq(parameters.runE2E, true) }}:
+      - template: ../stages/e2e.yml
+        parameters:
+          shards: ${{ parameters.e2eShards }}
+
+  - ${{ if ne(parameters.deployUpTo, 'none') }}:
+      - template: ../stages/deploy-env.yml
+        parameters:
+          environments: ${{ parameters.environments }}
+          deployUpTo: ${{ parameters.deployUpTo }}
+          runE2E: ${{ parameters.runE2E }}
+          runLoadTests: ${{ parameters.runLoadTests }}
+
+  - ${{ if eq(parameters.deployUpTo, 'prod') }}:
+      - template: ../stages/release.yml
+        parameters:
+          runE2E: ${{ parameters.runE2E }}
+          publishPackages: ${{ parameters.publishPackages }}
+
+  - template: ../stages/notify.yml
+    parameters:
+      environments: ${{ parameters.environments }}
+      deployUpTo: ${{ parameters.deployUpTo }}
+      runE2E: ${{ parameters.runE2E }}

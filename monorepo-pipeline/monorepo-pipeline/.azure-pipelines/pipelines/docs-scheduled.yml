@@ -1,0 +1,90 @@
+# =====================================================================================
+#  Separate pipeline: rebuild + publish docs when the main CI finishes on main, and
+#  weekly (online link check catches external rot).
+#
+#  Cross-pipeline reference: it consumes the `generated` and `docs-api-xml` artifacts
+#  produced by the main pipeline through a pipeline resource, then checks out the
+#  exact commit that CI built.
+#
+#  Create it in Azure DevOps pointing at this file, and set `source` below to the
+#  name of the main CI pipeline.
+# =====================================================================================
+name: docs-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+pr: none
+
+schedules:
+  - cron: '0 3 * * 0'
+    displayName: Weekly docs refresh + external link check
+    branches:
+      include:
+        - main
+    always: true
+
+resources:
+  pipelines:
+    - pipeline: ci                      # alias -> $(Pipeline.Workspace)/ci/<artifact>
+      source: acme-platform-ci          # <-- name of the pipeline created from azure-pipelines.yml
+      branch: main
+      trigger:
+        branches:
+          include:
+            - main
+
+variables:
+  - template: ../config/variables.yml
+  - group: acme-platform-shared
+
+pool:
+  vmImage: ubuntu-24.04
+
+stages:
+  - stage: Docs
+    jobs:
+      - job: BuildAndPublish
+        timeoutInMinutes: 30
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - bash: |
+              set -euo pipefail
+              SHA="$(resources.pipeline.ci.sourceCommit)"
+              if [[ -n "$SHA" && "$SHA" != *'$('* ]] && git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
+                git checkout --detach "$SHA"
+              else
+                echo "No CI source commit available (scheduled run) - using branch head"
+              fi
+              git log -1 --oneline
+            displayName: Check out the commit CI built
+
+          - template: ../templates/steps/download-generated.yml
+            parameters:
+              source: ci
+              generatedDir: $(Pipeline.Workspace)/ci/generated
+
+          - download: ci
+            artifact: docs-api-xml
+            displayName: Download .NET XML docs from CI
+            continueOnError: true
+
+          - template: ../templates/steps/build-docs.yml
+            parameters:
+              version: $(resources.pipeline.ci.runName)
+              xmlDocsDir: $(Pipeline.Workspace)/ci/docs-api-xml
+
+          - bash: |
+              docker run --rm -v "$(Build.SourcesDirectory)/docs/build:/input:ro" lycheeverse/lychee:latest \
+                --no-progress --max-concurrency 8 --accept 200,204,429 --root-dir /input '/input/**/*.html'
+            displayName: lychee (online) external link check
+            continueOnError: true
+
+          - task: AzureStaticWebApp@0
+            displayName: Deploy docs to production
+            inputs:
+              app_location: docs/build
+              skip_app_build: true
+              skip_api_build: true
+              azure_static_web_apps_api_token: $(docsSwaToken)
+              deployment_environment: production

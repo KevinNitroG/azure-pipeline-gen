@@ -1,0 +1,160 @@
+parameters:
+  # Each generator becomes its own job (compile-time expansion) and its own artifact.
+  - name: generators
+    type: object
+    default:
+      - name: ts
+        displayName: TypeScript types and zod client
+        runtimes: [node]
+        command: |
+          pnpm --filter "./packages/contracts" exec openapi-typescript "$SPEC" --output "$OUT/ts-client/schema.d.ts"
+          pnpm --filter "./packages/contracts" exec openapi-zod-client "$SPEC" --output "$OUT/ts-client/zod.ts"
+      - name: csharp
+        displayName: C# models and HttpClient
+        runtimes: [node, java]
+        command: |
+          pnpm dlx @openapitools/openapi-generator-cli generate \
+            -i "$SPEC" -g csharp -o "$OUT/csharp" \
+            --additional-properties=packageName=Acme.Contracts,targetFramework=net8.0,library=httpclient
+      - name: go
+        displayName: Go types and chi server stubs
+        runtimes: [go]
+        command: |
+          mkdir -p "$OUT/go"
+          go run github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@v2.4.1 \
+            -generate types,chi-server,spec -package contracts -o "$OUT/go/contracts.gen.go" "$SPEC"
+          (cd "$OUT/go" && go mod init github.com/acme/platform/contracts/generated/go && go mod tidy)
+      - name: proto
+        displayName: Protobuf (events between api and worker)
+        runtimes: [node]
+        command: |
+          pnpm dlx @bufbuild/buf generate packages/contracts/proto \
+            --template packages/contracts/buf.gen.yaml -o "$OUT/proto"
+
+stages:
+  - stage: Codegen
+    displayName: Code generation
+    dependsOn: [Detect]
+    condition: and(not(failed()), not(canceled()), eq(dependencies.Detect.outputs['Plan.plan.needsCodegen'], 'true'))
+    jobs:
+      # ---------------------------------------------------------------- lint spec + breaking changes
+      - job: SpecLint
+        displayName: Lint OpenAPI and detect breaking changes
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - template: ../steps/checkout.yml
+          - template: ../steps/setup-node.yml
+            parameters:
+              filter: ./packages/contracts...
+          - bash: |
+              set -euo pipefail
+              pnpm dlx @stoplight/spectral-cli lint packages/contracts/openapi/api.yaml \
+                --fail-severity=warn -f junit -o "$(Agent.TempDirectory)/spectral-junit.xml"
+            displayName: Spectral lint
+          - task: PublishTestResults@2
+            displayName: Publish Spectral results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: spectral-junit.xml
+              searchFolder: $(Agent.TempDirectory)
+              testRunTitle: OpenAPI lint
+          - bash: |
+              set -euo pipefail
+              TARGET="${SYSTEM_PULLREQUEST_TARGETBRANCH#refs/heads/}"
+              git fetch --no-tags --depth=1 origin "$TARGET"
+              git show FETCH_HEAD:packages/contracts/openapi/api.yaml > "$(Agent.TempDirectory)/base-api.yaml"
+              docker run --rm \
+                -v "$(Agent.TempDirectory):/base:ro" -v "$PWD/packages/contracts/openapi:/head:ro" \
+                tufin/oasdiff breaking /base/base-api.yaml /head/api.yaml --fail-on ERR
+            displayName: oasdiff breaking-change gate (PR vs target)
+            condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+
+      # ---------------------------------------------------------------- bundle
+      - job: Bundle
+        displayName: Bundle OpenAPI into a single document
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - template: ../steps/checkout.yml
+          - template: ../steps/setup-node.yml
+            parameters:
+              filter: ./packages/contracts...
+          - bash: |
+              set -euo pipefail
+              mkdir -p "$(Build.ArtifactStagingDirectory)/spec"
+              pnpm dlx @redocly/cli bundle packages/contracts/openapi/api.yaml \
+                -o "$(Build.ArtifactStagingDirectory)/spec/bundled.yaml"
+            displayName: Redocly bundle
+          - publish: $(Build.ArtifactStagingDirectory)/spec
+            artifact: spec
+
+      # ---------------------------------------------------------------- one job per generator
+      - ${{ each g in parameters.generators }}:
+          - job: Gen_${{ g.name }}
+            displayName: Generate - ${{ g.displayName }}
+            dependsOn: [Bundle]
+            pool:
+              vmImage: ubuntu-24.04
+            steps:
+              - template: ../steps/checkout.yml
+              - ${{ if containsValue(g.runtimes, 'node') }}:
+                  - template: ../steps/setup-node.yml
+                    parameters:
+                      filter: ./packages/contracts...
+              - ${{ if containsValue(g.runtimes, 'java') }}:
+                  - task: JavaToolInstaller@0
+                    displayName: Use JDK 17
+                    inputs:
+                      versionSpec: '17'
+                      jdkArchitectureOption: x64
+                      jdkSourceOption: PreInstalled
+              - ${{ if containsValue(g.runtimes, 'go') }}:
+                  - template: ../steps/setup-go.yml
+              - download: current
+                artifact: spec
+              - bash: |
+                  set -euo pipefail
+                  export SPEC="$(Pipeline.Workspace)/spec/bundled.yaml"
+                  export OUT="$(Build.ArtifactStagingDirectory)/gen"
+                  mkdir -p "$OUT"
+                  ${{ g.command }}
+                displayName: Run ${{ g.name }} generator
+              - publish: $(Build.ArtifactStagingDirectory)/gen
+                artifact: generated-${{ g.name }}
+
+      # ---------------------------------------------------------------- merge everything into one artifact
+      - job: Merge
+        displayName: Merge generated artifacts
+        dependsOn:
+          - Bundle
+          - SpecLint
+          - ${{ each g in parameters.generators }}:
+              - Gen_${{ g.name }}
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - checkout: none
+          - download: current
+            artifact: spec
+          - ${{ each g in parameters.generators }}:
+              - download: current
+                artifact: generated-${{ g.name }}
+          - bash: |
+              set -euo pipefail
+              M="$(Build.ArtifactStagingDirectory)/merged"
+              mkdir -p "$M/openapi"
+              cp "$(Pipeline.Workspace)/spec/bundled.yaml" "$M/openapi/bundled.yaml"
+            displayName: Start merged tree with bundled spec
+          - ${{ each g in parameters.generators }}:
+              - bash: cp -a "$(Pipeline.Workspace)/generated-${{ g.name }}/." "$(Build.ArtifactStagingDirectory)/merged/"
+                displayName: Merge generated-${{ g.name }}
+          - bash: |
+              set -euo pipefail
+              M="$(Build.ArtifactStagingDirectory)/merged"
+              (cd "$M" && find . -type f | sort | head -200)
+              test "$(find "$M" -type f | wc -l)" -gt 1
+            displayName: Sanity check merged output
+          - publish: $(Build.ArtifactStagingDirectory)/merged
+            artifact: generated

@@ -1,0 +1,33 @@
+# One authenticated call into scripts/helm-deploy.sh against an AKS cluster.
+parameters:
+  - name: mode
+    type: string
+  - name: service
+    type: string
+  - name: env
+    type: object
+  - name: weight
+    type: string
+    default: '0'
+  - name: condition
+    type: string
+    default: succeeded()
+
+steps:
+  - task: AzureCLI@2
+    displayName: helm ${{ parameters.mode }} - ${{ parameters.service }} in ${{ parameters.env.name }}
+    condition: ${{ parameters.condition }}
+    inputs:
+      azureSubscription: ${{ parameters.env.serviceConnection }}
+      scriptType: bash
+      scriptLocation: inlineScript
+      workingDirectory: $(Build.SourcesDirectory)
+      inlineScript: |
+        set -euo pipefail
+        az aks get-credentials --resource-group "${{ parameters.env.resourceGroup }}" \
+          --name "${{ parameters.env.aksCluster }}" --overwrite-existing --only-show-errors
+        command -v kubelogin >/dev/null || sudo az aks install-cli
+        kubelogin convert-kubeconfig -l azurecli
+        bash .azure-pipelines/scripts/helm-deploy.sh \
+          "${{ parameters.mode }}" "${{ parameters.service }}" "${{ parameters.env.name }}" \
+          "${{ parameters.env.namespace }}" "${{ parameters.weight }}"

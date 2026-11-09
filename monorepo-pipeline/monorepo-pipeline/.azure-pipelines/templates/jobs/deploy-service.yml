@@ -1,0 +1,102 @@
+# Deploys one containerised service (api / worker) to AKS via Helm.
+#   strategy canary  -> deploy canary release, shift traffic in increments, bake, promote | abort
+#   strategy runOnce -> helm upgrade --atomic, rollback on failure
+parameters:
+  - name: env                 # one entry of the `environments` parameter
+    type: object
+  - name: service             # { name, key }
+    type: object
+  - name: dependsOn
+    type: object
+    default: []
+
+jobs:
+  - deployment: Deploy_${{ parameters.service.key }}
+    displayName: ${{ parameters.service.name }} to ${{ parameters.env.name }} (${{ parameters.env.strategy }})
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: and(not(failed()), not(canceled()), eq(stageDependencies.Detect.Plan.outputs['plan.affected_${{ parameters.service.key }}'], 'true'))
+    timeoutInMinutes: 60
+    pool:
+      vmImage: ubuntu-24.04
+    environment: ${{ parameters.env.environment }}
+    variables:
+      semver: $[ stageDependencies.Detect.Version.outputs['ver.semver'] ]
+    strategy:
+      ${{ if eq(parameters.env.strategy, 'canary') }}:
+        canary:
+          increments: ${{ parameters.env.canaryIncrements }}
+          preDeploy:
+            steps:
+              - checkout: self
+                fetchDepth: 1
+              - download: current
+                artifact: image-manifest-${{ parameters.service.name }}
+          deploy:
+            steps:
+              - template: ../steps/helm-step.yml
+                parameters:
+                  mode: canary-deploy
+                  service: ${{ parameters.service.name }}
+                  env: ${{ parameters.env }}
+          routeTraffic:
+            steps:
+              - template: ../steps/helm-step.yml
+                parameters:
+                  mode: canary-weight
+                  weight: $(strategy.increment)
+                  service: ${{ parameters.service.name }}
+                  env: ${{ parameters.env }}
+          postRouteTraffic:
+            steps:
+              - bash: |
+                  echo "Baking at $(strategy.increment)% for 3 minutes"
+                  sleep 180
+                displayName: Bake
+              - template: ../steps/helm-step.yml
+                parameters:
+                  mode: verify
+                  service: ${{ parameters.service.name }}-canary
+                  env: ${{ parameters.env }}
+          on:
+            failure:
+              steps:
+                - template: ../steps/helm-step.yml
+                  parameters:
+                    mode: canary-abort
+                    service: ${{ parameters.service.name }}
+                    env: ${{ parameters.env }}
+            success:
+              steps:
+                - template: ../steps/helm-step.yml
+                  parameters:
+                    mode: canary-promote
+                    service: ${{ parameters.service.name }}
+                    env: ${{ parameters.env }}
+      ${{ else }}:
+        runOnce:
+          deploy:
+            steps:
+              - checkout: self
+                fetchDepth: 1
+              - download: current
+                artifact: image-manifest-${{ parameters.service.name }}
+              - template: ../steps/helm-step.yml
+                parameters:
+                  mode: stable
+                  service: ${{ parameters.service.name }}
+                  env: ${{ parameters.env }}
+              - template: ../steps/helm-step.yml
+                parameters:
+                  mode: verify
+                  service: ${{ parameters.service.name }}
+                  env: ${{ parameters.env }}
+          on:
+            failure:
+              steps:
+                - checkout: self
+                  fetchDepth: 1
+                - template: ../steps/helm-step.yml
+                  parameters:
+                    mode: rollback
+                    service: ${{ parameters.service.name }}
+                    env: ${{ parameters.env }}
